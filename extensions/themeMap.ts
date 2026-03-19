@@ -9,9 +9,16 @@
  *   catppuccin-mocha · cyberpunk · dracula · everforest · gruvbox
  *   midnight-ocean   · nord      · ocean-breeze · rose-pine
  *   synthwave        · tokyo-night
+ *
+ * This is a utility module imported by other extensions, not a standalone extension.
  */
 
-import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+
+// Empty extension factory - this is a utility module, not a standalone extension
+export default function (_pi: ExtensionAPI) {
+  // No-op: themeMap is imported by other extensions, not run directly
+};
 import { basename } from "path";
 import { fileURLToPath } from "url";
 
