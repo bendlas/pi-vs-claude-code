@@ -1,15 +1,25 @@
 /**
- * Subagent Widget — /sub, /subclear, /subrm, /subcont commands with stacking live widgets
+ * Subagent Widget — spawn, wait, and manage background subagents with live widgets
  *
  * Each /sub spawns a background Pi subagent with its own persistent session,
  * enabling conversation continuations via /subcont.
  *
  * Usage: pi -e extensions/subagent-widget.ts
- * Then:
- *   /sub list files and summarize          — spawn a new subagent
- *   /subcont 1 now write tests for it      — continue subagent #1's conversation
- *   /subrm 2                               — remove subagent #2 widget
- *   /subclear                              — clear all subagent widgets
+ *
+ * Commands:
+ *   /sub <task>               — spawn a new subagent
+ *   /subwait [ids]            — wait for subagent(s) to complete
+ *   /sublist                  — list all subagents with status
+ *   /subcont <id> <prompt>    — continue a subagent's conversation
+ *   /subrm <id>               — remove a subagent
+ *   /subclear                 — remove all subagents
+ *
+ * Tools:
+ *   subagent_create({ task })                     — spawn subagent
+ *   subagent_wait({ ids?, timeout? })             — wait for completion
+ *   subagent_list()                               — list subagents
+ *   subagent_continue({ id, prompt })             — continue conversation
+ *   subagent_remove({ id })                       — remove subagent
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
@@ -32,10 +42,13 @@ interface SubState {
 	sessionFile: string;   // persistent JSONL session path — used by /subcont to resume
 	turnCount: number;     // increments each time /subcont continues this agent
 	proc?: any;            // active ChildProcess ref (for kill on /subrm)
+	result?: string;       // cached final result for subagent_wait
+	completionResolve?: () => void;  // resolves when subagent completes
 }
 
 export default function (pi: ExtensionAPI) {
 	const agents: Map<number, SubState> = new Map();
+	const waitingIds: Set<number> = new Set();  // IDs being waited on — suppress their notifications
 	let nextId = 1;
 	let widgetCtx: any;
 
@@ -133,12 +146,12 @@ export default function (pi: ExtensionAPI) {
 		state: SubState,
 		prompt: string,
 		ctx: any,
-	): Promise<void> {
+	): Promise<string> {
 		const model = ctx.model
 			? `${ctx.model.provider}/${ctx.model.id}`
 			: "openrouter/google/gemini-3-flash-preview";
 
-		return new Promise<void>((resolve) => {
+		return new Promise<string>((resolve) => {
 			const proc = spawn("pi", [
 				"--mode", "json",
 				"-p",
@@ -185,21 +198,26 @@ export default function (pi: ExtensionAPI) {
 				state.elapsed = Date.now() - startTime;
 				state.status = code === 0 ? "done" : "error";
 				state.proc = undefined;
+				const result = state.textChunks.join("");
+				state.result = result;  // cache for subagent_wait
 				updateWidgets();
 
-				const result = state.textChunks.join("");
 				ctx.ui.notify(
 					`Subagent #${state.id} ${state.status} in ${Math.round(state.elapsed / 1000)}s`,
 					state.status === "done" ? "success" : "error"
 				);
 
-				pi.sendMessage({
-					customType: "subagent-result",
-					content: `Subagent #${state.id}${state.turnCount > 1 ? ` (Turn ${state.turnCount})` : ""} finished "${prompt}" in ${Math.round(state.elapsed / 1000)}s.\n\nResult:\n${result.slice(0, 8000)}${result.length > 8000 ? "\n\n... [truncated]" : ""}`,
-					display: true,
-				}, { deliverAs: "followUp", triggerTurn: true });
+				// Only send follow-up message if not being waited on
+				if (!waitingIds.has(state.id)) {
+					pi.sendMessage({
+						customType: "subagent-result",
+						content: `Subagent #${state.id}${state.turnCount > 1 ? ` (Turn ${state.turnCount})` : ""} finished "${prompt}" in ${Math.round(state.elapsed / 1000)}s.\n\nResult:\n${result.slice(0, 8000)}${result.length > 8000 ? "\n\n... [truncated]" : ""}`,
+						display: true,
+					}, { deliverAs: "followUp", triggerTurn: true });
+				}
 
-				resolve();
+				resolve(result);
+				if (state.completionResolve) state.completionResolve();
 			});
 
 			proc.on("error", (err) => {
@@ -207,8 +225,10 @@ export default function (pi: ExtensionAPI) {
 				state.status = "error";
 				state.proc = undefined;
 				state.textChunks.push(`Error: ${err.message}`);
+				state.result = state.textChunks.join("");
 				updateWidgets();
-				resolve();
+				resolve(state.result);
+				if (state.completionResolve) state.completionResolve();
 			});
 		});
 	}
@@ -297,6 +317,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			ctx.ui.setWidget(`sub-${args.id}`, undefined);
 			agents.delete(args.id);
+			waitingIds.delete(args.id);  // Clean up if being waited on
 
 			return {
 				content: [{ type: "text", text: `Subagent #${args.id} removed successfully.` }],
@@ -323,12 +344,127 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerTool({
+		name: "subagent_wait",
+		description: `Wait for subagent(s) to complete. Blocks until all specified subagents finish, then returns their results.
+
+Usage:
+  subagent_wait({ ids: [1, 2, 3] })     — wait for specific subagents
+  subagent_wait({})                     — wait for ALL spawned subagents
+  subagent_wait({ ids: [1], timeout: 60 }) — wait with 60s timeout
+
+Use this instead of polling subagent_list. Returns aggregated results when all complete. Waits forever if no timeout is specified.`,
+		parameters: Type.Object({
+			ids: Type.Optional(Type.Array(Type.Number()), { 
+				description: "Subagent IDs to wait for. If omitted, waits for ALL spawned subagents." 
+			}),
+			timeout: Type.Optional(Type.Number(), { 
+				description: "Max seconds to wait. If omitted, waits forever. Returns partial results on timeout." 
+			}),
+		}),
+		execute: async (callId, args, _signal, _onUpdate, ctx) => {
+			widgetCtx = ctx;
+			const targetIds = args.ids ?? Array.from(agents.keys());
+			const timeoutMs = args.timeout !== undefined ? args.timeout * 1000 : undefined;
+
+			if (targetIds.length === 0) {
+				return { content: [{ type: "text", text: "No subagents to wait for." }] };
+			}
+
+			// Validate IDs
+			const invalidIds = targetIds.filter(id => !agents.has(id));
+			if (invalidIds.length > 0) {
+				const validIds = Array.from(agents.keys());
+				return { 
+					content: [{ 
+						type: "text", 
+						text: `Error: Subagent(s) not found: ${invalidIds.join(", ")}\nAvailable IDs: ${validIds.length > 0 ? validIds.join(", ") : "none"}` 
+					}] 
+				};
+			}
+
+			// Mark these IDs as being waited on — suppress their notifications
+			for (const id of targetIds) {
+				waitingIds.add(id);
+			}
+
+			const startTime = Date.now();
+			const results: string[] = [];
+
+			// Wait for each subagent with optional timeout
+			for (const id of targetIds) {
+				const state = agents.get(id)!;
+				
+				if (state.status !== "running") {
+					// Already done - return cached result
+					const statusIcon = state.status === "done" ? "✓" : "✗";
+					results.push(`#${id} [${state.status.toUpperCase()}] (${Math.round(state.elapsed / 1000)}s, ${state.toolCount} tools) - "${state.task.slice(0, 50)}${state.task.length > 50 ? "..." : ""}"\n  Result: ${state.result?.slice(0, 500) ?? "(no result)"}${(state.result?.length ?? 0) > 500 ? "..." : ""}`);
+					continue;
+				}
+
+				// Check remaining timeout if one was specified
+				if (timeoutMs !== undefined) {
+					const remainingTime = timeoutMs - (Date.now() - startTime);
+					if (remainingTime <= 0) {
+						results.push(`#${id} [TIMEOUT] - exceeded total wait time`);
+						continue;
+					}
+
+					// Create a promise that resolves when this subagent completes
+					const completionPromise = new Promise<void>((resolve) => {
+						state.completionResolve = resolve;
+					});
+
+					const timedOut = await Promise.race([
+						completionPromise.then(() => false),
+						new Promise<boolean>(r => setTimeout(() => r(true), remainingTime))
+					]);
+
+					const statusIcon = state.status === "done" ? "✓" : state.status === "error" ? "✗" : "⏱";
+					const statusLabel = timedOut ? "TIMEOUT" : state.status.toUpperCase();
+					results.push(`#${id} [${statusLabel}] (${Math.round(state.elapsed / 1000)}s, ${state.toolCount} tools) - "${state.task.slice(0, 50)}${state.task.length > 50 ? "..." : ""}"\n  Result: ${state.result?.slice(0, 500) ?? "(no result)"}${(state.result?.length ?? 0) > 500 ? "..." : ""}`);
+				} else {
+					// No timeout - wait forever
+					await new Promise<void>((resolve) => {
+						state.completionResolve = resolve;
+					});
+
+					const statusIcon = state.status === "done" ? "✓" : "✗";
+					results.push(`#${id} [${state.status.toUpperCase()}] (${Math.round(state.elapsed / 1000)}s, ${state.toolCount} tools) - "${state.task.slice(0, 50)}${state.task.length > 50 ? "..." : ""}"\n  Result: ${state.result?.slice(0, 500) ?? "(no result)"}${(state.result?.length ?? 0) > 500 ? "..." : ""}`);
+				}
+			}
+
+			// Clear waited IDs
+			for (const id of targetIds) {
+				waitingIds.delete(id);
+			}
+
+			const totalWait = Math.round((Date.now() - startTime) / 1000);
+			const summary = `Waited for ${targetIds.length} subagent${targetIds.length !== 1 ? "s" : ""} (${totalWait}s total):\n\n${results.join("\n\n")}`;
+
+			return {
+				content: [{ type: "text", text: summary }],
+			};
+		},
+	});
+
 
 
 	// ── /sub <task> ───────────────────────────────────────────────────────────
 
 	pi.registerCommand("sub", {
-		description: "Spawn a subagent with live widget: /sub <task>",
+		description: `Spawn a subagent with live widget.
+
+Usage:
+  /sub <task>              — spawn a new subagent
+
+Examples:
+  /sub analyze the auth module and list security issues
+  /sub write tests for src/utils/parser.ts
+  /sub search for TODO comments and summarize them
+
+The subagent runs in the background with a live status widget.
+Use /subwait to block until done, or check status with /sub list.`,
 		handler: async (args, ctx) => {
 			widgetCtx = ctx;
 
@@ -360,7 +496,18 @@ export default function (pi: ExtensionAPI) {
 	// ── /subcont <number> <prompt> ────────────────────────────────────────────
 
 	pi.registerCommand("subcont", {
-		description: "Continue an existing subagent's conversation: /subcont <number> <prompt>",
+		description: `Continue an existing subagent's conversation.
+
+Usage:
+  /subcont <number> <prompt>   — continue subagent #<number> with new instructions
+
+Examples:
+  /subcont 1 now write tests for the issues you found
+  /subcont 2 expand the analysis to include edge cases
+  /subcont 3 summarize your findings in a markdown table
+
+The subagent maintains its conversation history from previous turns.
+Turn count is displayed in the widget.`,
 		handler: async (args, ctx) => {
 			widgetCtx = ctx;
 
@@ -408,7 +555,13 @@ export default function (pi: ExtensionAPI) {
 	// ── /subrm <number> ───────────────────────────────────────────────────────
 
 	pi.registerCommand("subrm", {
-		description: "Remove a specific subagent widget: /subrm <number>",
+		description: `Remove a specific subagent widget.
+
+Usage:
+  /subrm <number>   — remove subagent #<number>
+
+If the subagent is still running, it will be killed first.
+The widget is removed and the subagent ID is freed.`,
 		handler: async (args, ctx) => {
 			widgetCtx = ctx;
 
@@ -434,13 +587,20 @@ export default function (pi: ExtensionAPI) {
 
 			ctx.ui.setWidget(`sub-${num}`, undefined);
 			agents.delete(num);
+			waitingIds.delete(num);  // Clean up if being waited on
 		},
 	});
 
 	// ── /subclear ─────────────────────────────────────────────────────────────
 
 	pi.registerCommand("subclear", {
-		description: "Clear all subagent widgets",
+		description: `Clear all subagent widgets.
+
+Usage:
+  /subclear   — remove all subagents
+
+Kills any running subagents and clears all widgets.
+Resets the subagent ID counter.`,
 		handler: async (_args, ctx) => {
 			widgetCtx = ctx;
 
@@ -455,12 +615,105 @@ export default function (pi: ExtensionAPI) {
 
 			const total = agents.size;
 			agents.clear();
+			waitingIds.clear();
 			nextId = 1;
 
 			const msg = total === 0
 				? "No subagents to clear."
 				: `Cleared ${total} subagent${total !== 1 ? "s" : ""}${killed > 0 ? ` (${killed} killed)` : ""}.`;
 			ctx.ui.notify(msg, total === 0 ? "info" : "success");
+		},
+	});
+
+	// ── /subwait ──────────────────────────────────────────────────────────────
+
+	pi.registerCommand("subwait", {
+		description: `Wait for subagent(s) to complete.
+
+Usage:
+  /subwait          — wait for ALL subagents
+  /subwait 1        — wait for subagent #1
+  /subwait 1 2 3    — wait for multiple subagents
+
+Blocks until the specified subagents finish, then shows a summary.
+Interrupt with Ctrl+C if you get tired of waiting.`,
+		handler: async (args, ctx) => {
+			widgetCtx = ctx;
+
+			const trimmed = args?.trim() ?? "";
+
+			// Parse arguments: space-separated IDs
+			const ids = trimmed.split(/\s+/)
+				.map(s => parseInt(s, 10))
+				.filter(n => !isNaN(n));
+
+			// Default: wait for all
+			const targetIds = ids.length > 0 ? ids : Array.from(agents.keys());
+
+			if (targetIds.length === 0) {
+				ctx.ui.notify("No subagents to wait for.", "info");
+				return;
+			}
+
+			// Mark these IDs as being waited on — suppress their notifications
+			for (const id of targetIds) {
+				waitingIds.add(id);
+			}
+
+			ctx.ui.notify(`Waiting for ${targetIds.length} subagent${targetIds.length !== 1 ? "s" : ""}…`, "info");
+
+			const startTime = Date.now();
+
+			for (const id of targetIds) {
+				const state = agents.get(id);
+				if (!state) continue;
+				if (state.status !== "running") continue;
+
+				await new Promise<void>((resolve) => {
+					state.completionResolve = resolve;
+				});
+			}
+
+			// Clear waited IDs
+			for (const id of targetIds) {
+				waitingIds.delete(id);
+			}
+
+			// Show summary
+			const results: string[] = [];
+			for (const id of targetIds) {
+				const state = agents.get(id);
+				if (!state) continue;
+				const statusIcon = state.status === "done" ? "✓" : state.status === "error" ? "✗" : "⏱";
+				results.push(`${statusIcon} #${id} [${state.status.toUpperCase()}] (${Math.round(state.elapsed / 1000)}s) - ${state.task.slice(0, 40)}${state.task.length > 40 ? "..." : ""}`);
+			}
+
+			const totalWait = Math.round((Date.now() - startTime) / 1000);
+			ctx.ui.notify(`Wait complete (${totalWait}s):\n${results.join("\n")}`, "success");
+		},
+	});
+
+	// ── /sub list ─────────────────────────────────────────────────────────────
+
+	pi.registerCommand("sublist", {
+		description: `List all subagents with their status.
+
+Usage:
+  /sublist   — show all subagents
+
+Shows ID, status, turn count, and task for each subagent.`,
+		handler: async (_args, ctx) => {
+			if (agents.size === 0) {
+				ctx.ui.notify("No subagents.", "info");
+				return;
+			}
+
+			const lines = Array.from(agents.values()).map(s => {
+				const statusIcon = s.status === "running" ? "●" : s.status === "done" ? "✓" : "✗";
+				return `${statusIcon} #${s.id} [${s.status.toUpperCase()}] (Turn ${s.turnCount}) - ${s.task.slice(0, 50)}${s.task.length > 50 ? "..." : ""}`;
+			});
+
+			ctx.ui.notify(`Subagents:\n${lines.join("\n")}`, "info");
 		},
 	});
 
@@ -475,6 +728,7 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.setWidget(`sub-${id}`, undefined);
 		}
 		agents.clear();
+		waitingIds.clear();
 		nextId = 1;
 		widgetCtx = ctx;
 	});
