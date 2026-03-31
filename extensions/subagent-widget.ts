@@ -25,8 +25,9 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { DynamicBorder } from "@mariozechner/pi-coding-agent";
 import { Container, Text } from "@mariozechner/pi-tui";
+import { StringEnum } from "@mariozechner/pi-ai";
 import { Type } from "@sinclair/typebox";
-const { spawn } = require("child_process") as any;
+import { spawn } from "node:child_process";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
@@ -44,6 +45,10 @@ interface SubState {
 	proc?: any;            // active ChildProcess ref (for kill on /subrm)
 	result?: string;       // cached final result for subagent_wait
 	completionResolve?: () => void;  // resolves when subagent completes
+	// Subagent configuration
+	model?: string;        // model override for this subagent
+	tools?: string;        // tools override for this subagent
+	thinking?: string;     // thinking level override
 }
 
 export default function (pi: ExtensionAPI) {
@@ -146,27 +151,42 @@ export default function (pi: ExtensionAPI) {
 		state: SubState,
 		prompt: string,
 		ctx: any,
+		signal?: AbortSignal,
 	): Promise<string> {
-		const model = ctx.model
-			? `${ctx.model.provider}/${ctx.model.id}`
-			: "openrouter/google/gemini-3-flash-preview";
+		// Default model: free qwen, or inherit from ctx, or fallback
+		const model = state.model
+			?? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : null)
+			?? "openrouter/qwen/qwen3.6-plus-preview:free";
+
+		// Build spawn args
+		const spawnArgs = [
+			"--mode", "json",
+			"-p",
+			"--session", state.sessionFile,
+			"--no-extensions",
+			"--model", model,
+			"--tools", state.tools ?? "read,bash,grep,find,ls",
+			"--thinking", state.thinking ?? "off",
+			prompt,
+		];
 
 		return new Promise<string>((resolve) => {
-			const proc = spawn("pi", [
-				"--mode", "json",
-				"-p",
-				"--session", state.sessionFile,   // persistent session for /subcont resumption
-				"--no-extensions",
-				"--model", model,
-				"--tools", "read,bash,grep,find,ls",
-				"--thinking", "off",
-				prompt,
-			], {
+			const proc = spawn("pi", spawnArgs, {
 				stdio: ["ignore", "pipe", "pipe"],
 				env: { ...process.env },
 			});
 
 			state.proc = proc;
+
+			// Handle abort signal
+			let aborted = false;
+			if (signal) {
+				const abortHandler = () => {
+					aborted = true;
+					proc.kill("SIGTERM");
+				};
+				signal.addEventListener("abort", abortHandler, { once: true });
+			}
 
 			const startTime = Date.now();
 			const timer = setInterval(() => {
@@ -196,16 +216,20 @@ export default function (pi: ExtensionAPI) {
 				if (buffer.trim()) processLine(state, buffer);
 				clearInterval(timer);
 				state.elapsed = Date.now() - startTime;
-				state.status = code === 0 ? "done" : "error";
+				state.status = aborted ? "error" : (code === 0 ? "done" : "error");
 				state.proc = undefined;
 				const result = state.textChunks.join("");
 				state.result = result;  // cache for subagent_wait
 				updateWidgets();
 
-				ctx.ui.notify(
-					`Subagent #${state.id} ${state.status} in ${Math.round(state.elapsed / 1000)}s`,
-					state.status === "done" ? "success" : "error"
-				);
+				if (!ctx.hasUI) {
+					// Non-interactive mode - no notifications
+				} else if (!waitingIds.has(state.id)) {
+					ctx.ui.notify(
+						`Subagent #${state.id} ${state.status} in ${Math.round(state.elapsed / 1000)}s`,
+						state.status === "done" ? "success" : "error"
+					);
+				}
 
 				// Only send follow-up message if not being waited on
 				if (!waitingIds.has(state.id)) {
@@ -237,11 +261,27 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "subagent_create",
+		label: "Create Subagent",
 		description: "Spawn a background subagent to perform a task. Returns the subagent ID immediately while it runs in the background. Results will be delivered as a follow-up message when finished.",
+		promptSnippet: "Spawn a background agent to perform an isolated task",
+		promptGuidelines: [
+			"Use subagent_create for tasks that benefit from an isolated context window.",
+			"Subagents can use a different model via the 'model' parameter.",
+			"Specify 'tools' to give subagents read-only access (read,grep,find,ls) or full access.",
+		],
 		parameters: Type.Object({
 			task: Type.String({ description: "The complete task description for the subagent to perform" }),
+			model: Type.Optional(Type.String({ 
+				description: "Model to use (e.g., 'anthropic/claude-sonnet-4-5', 'openai/gpt-4o'). Default: inherits from current session or qwen/qwen3.6-plus-preview:free" 
+			})),
+			tools: Type.Optional(Type.String({ 
+				description: "Comma-separated tools: read,bash,edit,write,grep,find,ls. Default: read,bash,grep,find,ls" 
+			})),
+			thinking: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh"] as const, {
+				description: "Thinking level. Default: off (fastest)"
+			})),
 		}),
-		execute: async (callId, args, _signal, _onUpdate, ctx) => {
+		execute: async (callId, args, signal, _onUpdate, ctx) => {
 			widgetCtx = ctx;
 			const id = nextId++;
 			const state: SubState = {
@@ -253,12 +293,15 @@ export default function (pi: ExtensionAPI) {
 				elapsed: 0,
 				sessionFile: makeSessionFile(id),
 				turnCount: 1,
+				model: args.model,
+				tools: args.tools,
+				thinking: args.thinking,
 			};
 			agents.set(id, state);
 			updateWidgets();
 
-			// Fire-and-forget
-			spawnAgent(state, args.task, ctx);
+			// Fire-and-forget with signal for abort support
+			spawnAgent(state, args.task, ctx, signal);
 
 			return {
 				content: [{ type: "text", text: `Subagent #${id} spawned and running in background.` }],
@@ -268,19 +311,20 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "subagent_continue",
+		label: "Continue Subagent",
 		description: "Continue an existing subagent's conversation. Use this to give further instructions to a finished subagent. Returns immediately while it runs in the background.",
 		parameters: Type.Object({
 			id: Type.Number({ description: "The ID of the subagent to continue" }),
 			prompt: Type.String({ description: "The follow-up prompt or new instructions" }),
 		}),
-		execute: async (callId, args, _signal, _onUpdate, ctx) => {
+		execute: async (callId, args, signal, _onUpdate, ctx) => {
 			widgetCtx = ctx;
 			const state = agents.get(args.id);
 			if (!state) {
-				return { content: [{ type: "text", text: `Error: No subagent #${args.id} found.` }] };
+				throw new Error(`No subagent #${args.id} found.`);
 			}
 			if (state.status === "running") {
-				return { content: [{ type: "text", text: `Error: Subagent #${args.id} is still running.` }] };
+				throw new Error(`Subagent #${args.id} is still running. Wait for it to finish first.`);
 			}
 
 			state.status = "running";
@@ -291,7 +335,7 @@ export default function (pi: ExtensionAPI) {
 			updateWidgets();
 
 			ctx.ui.notify(`Continuing Subagent #${args.id} (Turn ${state.turnCount})…`, "info");
-			spawnAgent(state, args.prompt, ctx);
+			spawnAgent(state, args.prompt, ctx, signal);
 
 			return {
 				content: [{ type: "text", text: `Subagent #${args.id} continuing conversation in background.` }],
@@ -301,6 +345,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "subagent_remove",
+		label: "Remove Subagent",
 		description: "Remove a specific subagent. Kills it if it's currently running.",
 		parameters: Type.Object({
 			id: Type.Number({ description: "The ID of the subagent to remove" }),
@@ -309,7 +354,7 @@ export default function (pi: ExtensionAPI) {
 			widgetCtx = ctx;
 			const state = agents.get(args.id);
 			if (!state) {
-				return { content: [{ type: "text", text: `Error: No subagent #${args.id} found.` }] };
+				throw new Error(`No subagent #${args.id} found.`);
 			}
 
 			if (state.proc && state.status === "running") {
@@ -327,6 +372,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "subagent_list",
+		label: "List Subagents",
 		description: "List all active and finished subagents, showing their IDs, tasks, and status.",
 		parameters: Type.Object({}),
 		execute: async () => {
@@ -346,6 +392,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "subagent_wait",
+		label: "Wait for Subagents",
 		description: `Wait for subagent(s) to complete. Blocks until all specified subagents finish, then returns their results.
 
 Usage:
@@ -375,12 +422,7 @@ Use this instead of polling subagent_list. Returns aggregated results when all c
 			const invalidIds = targetIds.filter(id => !agents.has(id));
 			if (invalidIds.length > 0) {
 				const validIds = Array.from(agents.keys());
-				return { 
-					content: [{ 
-						type: "text", 
-						text: `Error: Subagent(s) not found: ${invalidIds.join(", ")}\nAvailable IDs: ${validIds.length > 0 ? validIds.join(", ") : "none"}` 
-					}] 
-				};
+				throw new Error(`Subagent(s) not found: ${invalidIds.join(", ")}. Available IDs: ${validIds.length > 0 ? validIds.join(", ") : "none"}`);
 			}
 
 			// Mark these IDs as being waited on — suppress their notifications
@@ -456,21 +498,51 @@ Use this instead of polling subagent_list. Returns aggregated results when all c
 		description: `Spawn a subagent with live widget.
 
 Usage:
-  /sub <task>              — spawn a new subagent
+  /sub [options] <task>
+
+Options:
+  --model <model>      Model to use (e.g., anthropic/claude-sonnet-4-5)
+  --tools <list>       Comma-separated tools (default: read,bash,grep,find,ls)
+  --thinking <level>   Thinking level: off, minimal, low, medium, high, xhigh
 
 Examples:
   /sub analyze the auth module and list security issues
-  /sub write tests for src/utils/parser.ts
-  /sub search for TODO comments and summarize them
+  /sub --model openai/gpt-4o review this code
+  /sub --tools read,grep,find,ls search for TODO comments
+  /sub --thinking high solve this complex problem
 
 The subagent runs in the background with a live status widget.
-Use /subwait to block until done, or check status with /sub list.`,
+Use /subwait to block until done, or check status with /sublist.`,
 		handler: async (args, ctx) => {
 			widgetCtx = ctx;
 
-			const task = args?.trim();
+			if (!args?.trim()) {
+				ctx.ui.notify("Usage: /sub [--model <model>] [--tools <list>] [--thinking <level>] <task>", "error");
+				return;
+			}
+
+			// Parse options
+			let task = args.trim();
+			let model: string | undefined;
+			let tools: string | undefined;
+			let thinking: string | undefined;
+
+			const parseOption = (flag: string): string | null => {
+				const regex = new RegExp(`--${flag}\\s+(\\S+)`);
+				const match = task.match(regex);
+				if (match) {
+					task = task.replace(regex, "").trim();
+					return match[1];
+				}
+				return null;
+			};
+
+			model = parseOption("model") ?? undefined;
+			tools = parseOption("tools") ?? undefined;
+			thinking = parseOption("thinking") ?? undefined;
+
 			if (!task) {
-				ctx.ui.notify("Usage: /sub <task>", "error");
+				ctx.ui.notify("Usage: /sub [--model <model>] [--tools <list>] [--thinking <level>] <task>", "error");
 				return;
 			}
 
@@ -484,6 +556,9 @@ Use /subwait to block until done, or check status with /sub list.`,
 				elapsed: 0,
 				sessionFile: makeSessionFile(id),
 				turnCount: 1,
+				model,
+				tools,
+				thinking,
 			};
 			agents.set(id, state);
 			updateWidgets();
